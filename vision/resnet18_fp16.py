@@ -10,7 +10,6 @@ from PIL import Image
 
 torch.manual_seed(123)
 
-
 # Configuration
 MODEL_NAME = "microsoft/resnet-18"
 DATASET_NAME = "fashion_mnist" # "cifar100" or "fashion_mnist"

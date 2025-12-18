@@ -30,7 +30,6 @@ DATASET_CONFIGS = {
     }
 }
 
-
 # Training settings
 PRECISION = "16-mixed" 
 BATCH_SIZE = 12
