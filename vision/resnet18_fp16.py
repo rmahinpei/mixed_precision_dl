@@ -217,7 +217,7 @@ for lr in LEARNING_RATES:
         ignore_mismatched_sizes=True  
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     model, optimizer = fabric.setup(model, optimizer)
 
     start = time.time()
@@ -265,7 +265,7 @@ model = AutoModelForImageClassification.from_pretrained(
     ignore_mismatched_sizes=True
 )
 
-optimizer = torch.optim.Adam(model.parameters(), lr=best_lr, weight_decay=WEIGHT_DECAY)
+optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
 model, optimizer = fabric.setup(model, optimizer)
 
 start = time.time()

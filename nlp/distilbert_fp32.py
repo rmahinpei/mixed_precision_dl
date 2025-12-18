@@ -1,68 +1,54 @@
+import os
 import time
 import torch
 from torch.utils.data import DataLoader, Dataset
 from datasets import load_dataset
 from lightning import Fabric
 import torchmetrics
-from transformers import AutoImageProcessor, AutoModelForImageClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from watermark import watermark
-from PIL import Image
 
 torch.manual_seed(123)
 
-
 # Configuration
-MODEL_NAME = "microsoft/resnet-50"
-DATASET_NAME = "fashion_mnist" # "cifar100" or "fashion_mnist"
+MODEL_NAME = "distilbert-base-uncased"
+DATASET_NAME = "emotion" # "imdb" or "emotion"
 DATASET_CONFIGS = {
-    "cifar100": {
-        "path": "cifar100",
-        "num_classes": 100,
+    "imdb": {
+        "path": "imdb",
+        "text_column": "text",
+        "label_column": "label",
+        "num_classes": 2,
         "has_validation": False,
-        "image_key": "img",
-        "label_key": "fine_label",
     },
-    "fashion_mnist": {
-        "path": "fashion_mnist",
-        "num_classes": 10,
-        "has_validation": False,
-        "image_key": "image",
-        "label_key": "label",
+    "emotion": {
+        "path": "emotion",
+        "text_column": "text",
+        "label_column": "label",
+        "num_classes": 6,
+        "has_validation": True,
     }
 }
 
 
 # Training settings
-PRECISION = "16-mixed"
-BATCH_SIZE = 64
+PRECISION = "32-true" 
+BATCH_SIZE = 12
 NUM_EPOCHS = 1
+MAX_LENGTH = 512
 
 
 # Learning rate grid search
-LEARNING_RATES = [1e-5, 5e-5, 1e-4, 5e-4]
+LEARNING_RATES = [1e-5, 2e-5, 5e-5, 1e-4]
 
 
-# Dataset class
-class VisionDataset(Dataset):
-    def __init__(self, dataset_dict, partition_key, image_processor, image_key, label_key):
+# Custom dataset class
+class TextDataset(Dataset):
+    def __init__(self, dataset_dict, partition_key="train"):
         self.partition = dataset_dict[partition_key]
-        self.image_processor = image_processor
-        self.image_key = image_key
-        self.label_key = label_key
 
     def __getitem__(self, index):
-        item = self.partition[index]
-        image = item[self.image_key]
-
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-
-        processed = self.image_processor(image, return_tensors="pt")
-
-        return {
-            "pixel_values": processed["pixel_values"].squeeze(0),
-            "label": item[self.label_key]
-        }
+        return self.partition[index]
 
     def __len__(self):
         return self.partition.num_rows
@@ -71,11 +57,16 @@ class VisionDataset(Dataset):
 # Load dataset configuration
 config = DATASET_CONFIGS[DATASET_NAME]
 NUM_CLASSES = config["num_classes"]
-image_key = config["image_key"]
-label_key = config["label_key"]
+text_col = config["text_column"]
+label_col = config["label_column"]
 
 print(f"\nLoading {DATASET_NAME} dataset...")
-dataset = load_dataset(config["path"])
+
+# Load dataset based on configuration
+if "subset" in config:
+    dataset = load_dataset(config["path"], config["subset"])
+else:
+    dataset = load_dataset(config["path"])
 
 # Create validation split if needed
 if not config["has_validation"]:
@@ -89,45 +80,53 @@ print(f"Validation size: {len(dataset['validation'])}")
 print(f"Test size: {len(dataset['test'])}")
 
 
-# Load image processor
-print(f"\nLoading image processor for {MODEL_NAME}...")
-image_processor = AutoImageProcessor.from_pretrained(MODEL_NAME)
-print(f"Image processor loaded successfully")
+# Tokenization
+print(f"\nLoading tokenizer for {MODEL_NAME}...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+print(f"Tokenizer vocabulary size: {tokenizer.vocab_size}")
+
+def tokenize_text(batch):
+    return tokenizer(
+        batch[text_col],
+        truncation=True,
+        padding=True,
+        max_length=MAX_LENGTH
+    )
+
+print("Tokenizing dataset...")
+tokenized_dataset = dataset.map(tokenize_text, batched=True, batch_size=None)
+tokenized_dataset.set_format("torch", columns=["input_ids", "attention_mask", label_col])
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 # Create dataloaders
-train_dataset = VisionDataset(dataset, "train", image_processor, image_key, label_key)
-val_dataset = VisionDataset(dataset, "validation", image_processor, image_key, label_key)
-test_dataset = VisionDataset(dataset, "test", image_processor, image_key, label_key)
+if label_col != "label":
+    tokenized_dataset = tokenized_dataset.rename_column(label_col, "label")
 
-def collate_fn(batch):
-    pixel_values = torch.stack([item["pixel_values"] for item in batch])
-    labels = torch.tensor([item["label"] for item in batch])
-    return {"pixel_values": pixel_values, "labels": labels}
+train_dataset = TextDataset(tokenized_dataset, partition_key="train")
+val_dataset = TextDataset(tokenized_dataset, partition_key="validation")
+test_dataset = TextDataset(tokenized_dataset, partition_key="test")
 
 train_loader = DataLoader(
     dataset=train_dataset,
     batch_size=BATCH_SIZE,
     shuffle=True,
-    num_workers=4,
-    collate_fn=collate_fn,
-    pin_memory=True,
+    num_workers=2,
+    drop_last=True,
 )
 
 val_loader = DataLoader(
     dataset=val_dataset,
     batch_size=BATCH_SIZE,
-    num_workers=4,
-    collate_fn=collate_fn,
-    pin_memory=True,
+    num_workers=2,
+    drop_last=True,
 )
 
 test_loader = DataLoader(
     dataset=test_dataset,
     batch_size=BATCH_SIZE,
-    num_workers=4,
-    collate_fn=collate_fn,
-    pin_memory=True,
+    num_workers=2,
+    drop_last=True,
 )
 
 
@@ -139,47 +138,42 @@ def train(num_epochs, model, optimizer, train_loader, val_loader, fabric, num_cl
         train_acc = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes).to(fabric.device)
 
         model.train()
-        total_loss = 0
         for batch_idx, batch in enumerate(train_loader):
             outputs = model(
-                pixel_values=batch["pixel_values"],
-                labels=batch["labels"]
+                batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["label"]
             )
-
             optimizer.zero_grad()
-            fabric.backward(outputs.loss)
+            fabric.backward(outputs["loss"])
             optimizer.step()
 
-            total_loss += outputs.loss.item()
+            if verbose and not batch_idx % 300:
+                print(f"Epoch: {epoch+1:04d}/{num_epochs:04d} | Batch {batch_idx:04d}/{len(train_loader):04d} | Loss: {outputs['loss']:.4f}")
 
-            if verbose and batch_idx % 100 == 0:
-                print(f"Epoch: {epoch+1:04d}/{num_epochs:04d} | Batch {batch_idx:04d}/{len(train_loader):04d} | Loss: {outputs.loss:.4f}")
-
+            model.eval()
             with torch.no_grad():
-                predicted_labels = torch.argmax(outputs.logits, 1)
-                train_acc.update(predicted_labels, batch["labels"])
-
-        avg_loss = total_loss / len(train_loader)
+                predicted_labels = torch.argmax(outputs["logits"], 1)
+                train_acc.update(predicted_labels, batch["label"])
+            model.train()
 
         model.eval()
         with torch.no_grad():
             val_acc = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes).to(fabric.device)
-            val_loss = 0
             for batch in val_loader:
                 outputs = model(
-                    pixel_values=batch["pixel_values"],
-                    labels=batch["labels"]
+                    batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["label"]
                 )
-                predicted_labels = torch.argmax(outputs.logits, 1)
-                val_acc.update(predicted_labels, batch["labels"])
-                val_loss += outputs.loss.item()
+                predicted_labels = torch.argmax(outputs["logits"], 1)
+                val_acc.update(predicted_labels, batch["label"])
 
-            avg_val_loss = val_loss / len(val_loader)
             val_acc_value = val_acc.compute()
-
             if verbose:
-                print(f"Epoch: {epoch+1:04d}/{num_epochs:04d} | Train Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Train Acc: {train_acc.compute()*100:.2f}% | Val Acc: {val_acc_value*100:.2f}%")
+                print(f"Epoch: {epoch+1:04d}/{num_epochs:04d} | Train acc.: {train_acc.compute()*100:.2f}% | Val acc.: {val_acc_value*100:.2f}%")
 
+            # Track best validation accuracy
             if val_acc_value > best_val_acc:
                 best_val_acc = val_acc_value
 
@@ -193,7 +187,6 @@ print(f"\nInitializing Fabric with precision: {PRECISION}")
 fabric = Fabric(accelerator="cuda", devices=1, precision=PRECISION)
 fabric.launch()
 
-# Setup dataloaders once
 train_loader, val_loader, test_loader = fabric.setup_dataloaders(
     train_loader, val_loader, test_loader
 )
@@ -211,10 +204,10 @@ lr_results = {}
 for lr in LEARNING_RATES:
     print(f"\n>>> Testing LR = {lr}")
     torch.manual_seed(123)  
-    model = AutoModelForImageClassification.from_pretrained(
+    
+    model = AutoModelForSequenceClassification.from_pretrained(
         MODEL_NAME,
-        num_labels=NUM_CLASSES,
-        ignore_mismatched_sizes=True  
+        num_labels=NUM_CLASSES
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -252,17 +245,16 @@ for lr, acc in lr_results.items():
 print(f"\nBest LR: {best_lr} with Val Acc: {best_val_acc*100:.2f}%")
 
 
-# Final training with best LR
+# Final training with best learning rate
 print("\n" + "="*60)
 print("FINAL TRAINING WITH BEST LR")
 print("="*60)
 print(f"Using LR = {best_lr}")
 
-torch.manual_seed(123)  
-model = AutoModelForImageClassification.from_pretrained(
+torch.manual_seed(123) 
+model = AutoModelForSequenceClassification.from_pretrained(
     MODEL_NAME,
-    num_labels=NUM_CLASSES,
-    ignore_mismatched_sizes=True
+    num_labels=NUM_CLASSES
 )
 
 optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
@@ -291,21 +283,17 @@ print("="*60)
 with torch.no_grad():
     model.eval()
     test_acc = torchmetrics.Accuracy(task="multiclass", num_classes=NUM_CLASSES).to(fabric.device)
-    test_loss = 0
 
     for batch in test_loader:
         outputs = model(
-            pixel_values=batch["pixel_values"],
-            labels=batch["labels"]
+            batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["label"]
         )
-        predicted_labels = torch.argmax(outputs.logits, 1)
-        test_acc.update(predicted_labels, batch["labels"])
-        test_loss += outputs.loss.item()
-
-    avg_test_loss = test_loss / len(test_loader)
+        predicted_labels = torch.argmax(outputs["logits"], 1)
+        test_acc.update(predicted_labels, batch["label"])
 
 print(f"\nMemory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
-print(f"Test loss: {avg_test_loss:.4f}")
 print(f"Test accuracy: {test_acc.compute()*100:.2f}%")
 
 print("\n" + "="*60)
